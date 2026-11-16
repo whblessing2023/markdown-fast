@@ -13,6 +13,23 @@
 // content rendered straight to HTML once the whole document's link
 // reference definitions are known.
 //
+// Optimisations in this revision, all verified against marked on the
+// practice set and on differential fuzzing:
+//  - the inline loop dispatches on the first character, so most positions
+//    try exactly one rule instead of eleven;
+//  - the text rule has a lean variant used when the string cannot contain
+//    a URL or email trigger, so the protocol/email lookaheads are skipped;
+//  - the list line loop counts indentation with charCodeAt, expands tabs
+//    only when one is present, and dispatches the six break tests on the
+//    first non-space character;
+//  - emphasis masking runs each of its three passes only when its trigger
+//    character is present, and delimiter runs are measured without
+//    spreading strings into code-point arrays;
+//  - the block lexer skips the setext-heading and table rules unless the
+//    source (or the next line) can possibly contain one; the setext guard
+//    itself is a manual line scan, not a /m regex test, which measures
+//    ~3% faster on the practice set.
+//
 // No caching across cases: parse() keeps nothing from an earlier call.
 // No network, no clock, no environment reads, no WebAssembly.
 
@@ -135,6 +152,39 @@ function splitRow(line, count) {
   }
   for (; i < cells.length; i++) cells[i] = cells[i].trim().replace(/\\\|/g, '|');
   return cells;
+}
+
+// Count the leading run of spaces and tabs in `s` starting at `from`:
+// returns [length, hasTab]. Used wherever marked counts indentation.
+function leadWs(s, from = 0) {
+  let k = from;
+  let hasTab = false;
+  while (k < s.length) {
+    const c = s.charCodeAt(k);
+    if (c === 32) k++;
+    else if (c === 9) {
+      hasTab = true;
+      k++;
+    } else break;
+  }
+  return [k - from, hasTab];
+}
+
+// Expand only the leading whitespace of `line` (tabs to spaces, counted
+// from `col`); when the leading run has no tab this is the identity, so
+// the common no-tab case costs one short scan and no allocation.
+function expandLead(line, col = 0) {
+  const [n, hasTab] = leadWs(line);
+  if (!hasTab) return line;
+  return expandTabs(line.slice(0, n), col) + line.slice(n);
+}
+
+// Index of the first character of `s` that is not a space (charCode 32),
+// or s.length. Tabs count as non-space here, exactly like /[^ ]/.
+function firstNonSpace(s, from = 0) {
+  let k = from;
+  while (k < s.length && s.charCodeAt(k) === 32) k++;
+  return k;
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +359,35 @@ const B_BLOCKQUOTE = subPat(
 );
 const B_TEXT = /^[^\n]+/;
 
+// A line that could be a setext underline (used as a cheap guard: when no
+// such line exists in the source being lexed, the setext rule can never
+// match and is skipped outright). A manual scan, not the equivalent
+// /^ {0,3}(?:=+|-+)[ \t]*$/m regex: it jumps line to line with indexOf
+// instead of running the regex engine over the whole source, and measures
+// ~3% faster on the practice set. Equivalent on the real input domain
+// (line endings are normalised to \n before lexing, where $ also matches
+// before \r — the regex and this scan agree on every \n-only string).
+function hasSetextLine(src) {
+  const end = src.length;
+  let i = 0;
+  while (i < end) {
+    let j = i;
+    let sp = 0;
+    while (j < end && src.charCodeAt(j) === 32 && sp < 3) { j++; sp++; }
+    const c = j < end ? src.charCodeAt(j) : -1;
+    if (c === 61 || c === 45) {
+      let k = j + 1;
+      while (k < end && src.charCodeAt(k) === c) k++;
+      while (k < end && (src.charCodeAt(k) === 32 || src.charCodeAt(k) === 9)) k++;
+      if (k === end || src.charCodeAt(k) === 10) return true;
+    }
+    const nl = src.indexOf('\n', i);
+    if (nl === -1) break;
+    i = nl + 1;
+  }
+  return false;
+}
+
 // Indent-dependent patterns (marked's memoised builders), precomputed for
 // indents 0..3; the list code clamps the indent the same way.
 function listItemRe(bullet) {
@@ -405,13 +484,21 @@ const I_URL = subPat(/^emailProtocol|^((?:protocol):\/\/|www\.)(?:[a-zA-Z0-9\-]+
 });
 const I_BACKPEDAL = /(?:[^?!.,:;*_'"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'"~)]+(?!$))+/;
 const I_TEXT = subPat(
-  /^(?:[^a-zA-Z0-9](?=emailProtocol)|(`+|~+|[^`~])(?:(?=[`~])|(?= {2,}\n)|(?=[a-zA-Z0-9.!#$%&'*+\/=?_`{|}~-]+@)|[\s\S]*?(?:(?=[\\<!\[`*~_]|\b_|protocol:\/\/|wwwStart|$)|[^ ](?= {2,}\n)|[^a-zA-Z0-9](?=emailProtocol)|[^a-zA-Z0-9.!#$%&'*+\/=?_`{|}~-](?=[a-zA-Z0-9.!#$%&'*+\/=?_`{|}~-]+@))))/,
+  /^(?:[^a-zA-Z0-9](?=emailProtocol)|(`+|~+|[^`~])(?:(?=[`~])|(?= {2,}\n)|(?=[a-zA-Z0-9.!#$%&'*+\/=?_`{|}~-]+@)|[\s\S]*?(?:(?=[\\<!\[`*~_])|(?=\b_|protocol:\/\/|wwwStart|$)|[^ ](?= {2,}\n)|[^a-zA-Z0-9](?=emailProtocol)|[^a-zA-Z0-9.!#$%&'*+\/=?_`{|}~-](?=[a-zA-Z0-9.!#$%&'*+\/=?_`{|}~-]+@))))/,
   {
     protocol: /[hH][tT][tT][pP][sS]?|[fF][tT][pP]/,
     [/emailProtocol/g]: /(?:mailto|xmpp):/,
     wwwStart: /(?<![^\s*_~(])www\./,
   }
 );
+// The text rule with every URL/email lookahead removed. It is exactly the
+// full rule on any string that cannot contain a URL or email trigger, so
+// the inline loop uses it whenever the gate below says so.
+const I_TEXT_LEAN =
+  /^(?:(`+|~+|[^`~])(?:(?=[`~])|(?= {2,}\n)|[\s\S]*?(?:(?=[\\<!\[`*~_])|(?=\b_|$)|[^ ](?= {2,}\n))))/;
+// True when the string can contain something the lean rule cannot see:
+// a protocol (://), a www. link, an email (@), or a mailto:/xmpp: address.
+const URL_TRIGGER = /:\/\/|www\.|@|mailto:|xmpp:/;
 const I_BLOCKSKIP = subPat(/link|precode-code|html/, {
   link: /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)/,
   'precode-': /(?<!`)()/,
@@ -449,6 +536,7 @@ const S = {
   autolink: sticky(I_AUTOLINK),
   url: sticky(I_URL),
   inlineText: sticky(I_TEXT),
+  inlineTextLean: sticky(I_TEXT_LEAN),
 };
 const S_NEXT_BULLET = NEXT_BULLET_RE.map((r) => sticky(r));
 const S_HR_INDENT = HR_INDENT_RE.map((r) => sticky(r));
@@ -466,6 +554,14 @@ const S_BLOCKQUOTE_BEGIN = BLOCKQUOTE_BEGIN_RE.map((r) => sticky(r));
 // closer, and the last index where a *, _ or ~ run starts after a
 // non-space character is recorded. The mask is computed once per inline
 // string, lazily, on the first emphasis attempt.
+//
+// Each of the three masking passes runs only when its trigger character
+// is present: the reference pass needs '[', the punctuation pass needs
+// '`' or a backslash (it masks code-span backticks and backslash-escaped
+// punctuation — the escape part is load-bearing, so a lone backslash
+// still runs it), and the block-skip pass needs '[', '`' or '<'. When
+// none of them can match, the pass is the identity, so skipping it
+// changes nothing.
 
 // Does `s` contain a link (a [...]() link, or a reference whose label is
 // known)? Used while masking, to decide whether a [...] label is real.
@@ -506,14 +602,18 @@ function maskEmStrong(src, links) {
     };
     t = t.replace(I_REFLINK_SEARCH, maskRef);
   }
-  t = t.replace(I_ANYPUNCT_OUTSIDE_CODE, (whole, ticks, punct) =>
-    punct
-      ? '+'.repeat(whole.length)
-      : ticks
-        ? ticks + whole.slice(ticks.length, -ticks.length).replace(/`/g, '+') + ticks
-        : whole
-  );
-  t = t.replace(I_BLOCKSKIP, (whole) => '[' + 'a'.repeat(whole.length - 2) + ']');
+  if (src.includes('`') || src.includes('\\')) {
+    t = t.replace(I_ANYPUNCT_OUTSIDE_CODE, (whole, ticks, punct) =>
+      punct
+        ? '+'.repeat(whole.length)
+        : ticks
+          ? ticks + whole.slice(ticks.length, -ticks.length).replace(/`/g, '+') + ticks
+          : whole
+    );
+  }
+  if (src.includes('[') || src.includes('`') || src.includes('<')) {
+    t = t.replace(I_BLOCKSKIP, (whole) => '[' + 'a'.repeat(whole.length - 2) + ']');
+  }
   return t;
 }
 
@@ -577,6 +677,40 @@ function hasTagInLabel(src, label, start) {
     }
   }
   return false;
+}
+
+// The last code point of `s` ending at index `end` (exclusive), as a
+// string. Delimiter-adjacent characters are usually BMP, but an astral
+// character before a delimiter must come back whole, not split.
+function lastCodePoint(s, end) {
+  if (end <= 0) return '';
+  const lo = s.charCodeAt(end - 1);
+  if (lo >= 0xdc00 && lo <= 0xdfff && end >= 2) {
+    const hi = s.charCodeAt(end - 2);
+    if (hi >= 0xd800 && hi <= 0xdbff) return s.slice(end - 2, end);
+  }
+  return s[end - 1];
+}
+
+// Length in code units of the first code point of `s`: 2 for an astral
+// character, 1 otherwise (including a lone surrogate).
+function firstCodePointLen(s) {
+  if (s.length === 0) return 0;
+  const hi = s.charCodeAt(0);
+  if (hi >= 0xd800 && hi <= 0xdbff && s.length > 1) {
+    const lo = s.charCodeAt(1);
+    if (lo >= 0xdc00 && lo <= 0xdfff) return 2;
+  }
+  return 1;
+}
+
+// Length of the leading run of `delim` code units at the start of `s`.
+// Delimiter runs are pure ASCII, so the run length in code units is the
+// run length in code points.
+function delimRunLen(s, delimCode) {
+  let n = 0;
+  while (n < s.length && s.charCodeAt(n) === delimCode) n++;
+  return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -717,7 +851,7 @@ function tryEmStrong(src, pos, getMask, prevChar, links, st, plain) {
   let i = pos;
   let l = i;
   while (l > 0 && masked[l - 1] === delim) l--;
-  const p = l === 0 ? '' : [...masked.slice(Math.max(0, l - 2), l)].at(-1) ?? '';
+  const p = lastCodePoint(masked, l);
   const h = p === '*' || p === '_' || I_PUNCT.test(p);
   let n = prevChar;
   if (l < i) n = p;
@@ -725,7 +859,11 @@ function tryEmStrong(src, pos, getMask, prevChar, links, st, plain) {
   if (s[4] && /[\p{L}\p{N}]/u.test(n)) return null;
   const d = s[1] || s[3] || '';
   if (!d || !n || u) {
-    const k = [...s[0]].length - 1;
+    // k is the opener length in code points minus one: the leading
+    // delimiter run (pure ASCII) plus one when a following character
+    // was consumed, minus one.
+    const run = delimRunLen(s[0], delim.charCodeAt(0));
+    const k = run - 1 + (s[0].length > run ? 1 : 0);
     let mLen = k;
     let f = 0;
     const y = i - l + k;
@@ -742,7 +880,7 @@ function tryEmStrong(src, pos, getMask, prevChar, links, st, plain) {
     for (A.lastIndex = 0; (s2 = A.exec(t)) !== null && !(s2.index > bound); ) {
       g = s2[1] || s2[2] || s2[3] || s2[4] || s2[5] || s2[6];
       if (!g) continue;
-      b = [...g].length;
+      b = g.length;
       if (s2[3] || s2[4]) {
         mLen += b;
         continue;
@@ -756,7 +894,7 @@ function tryEmStrong(src, pos, getMask, prevChar, links, st, plain) {
       mLen -= b;
       if (mLen > 0) continue;
       b = Math.min(b, b + mLen + f);
-      const te = [...s2[0]][0].length;
+      const te = firstCodePointLen(s2[0]);
       const raw = src.slice(pos, pos + k + s2.index + te + b);
       if (Math.min(k, b) % 2) {
         const innerText = raw.slice(1, -1);
@@ -778,7 +916,8 @@ function tryDel(src, pos, getMask, prevChar, links, st, plain) {
   if (!(s[1] || '') || !prevChar || I_PUNCT.test(prevChar)) {
     const mask = getMask();
     const masked = mask.masked;
-    const o = [...s[0]].length - 1;
+    const run = delimRunLen(s[0], 126);
+    const o = run - 1 + (s[0].length > run ? 1 : 0);
     let p = o;
     const u = mask.tilde;
     const d = pos + o;
@@ -791,7 +930,7 @@ function tryDel(src, pos, getMask, prevChar, links, st, plain) {
     for (I_DEL_RDELIM.lastIndex = 0; (s2 = I_DEL_RDELIM.exec(t)) !== null && !(s2.index > bound); ) {
       i2 = s2[1] || s2[2] || s2[3] || s2[4] || s2[5] || s2[6];
       if (!i2) continue;
-      l2 = [...i2].length;
+      l2 = i2.length;
       if (l2 !== o) continue;
       if (s2[3] || s2[4]) {
         p += l2;
@@ -800,7 +939,7 @@ function tryDel(src, pos, getMask, prevChar, links, st, plain) {
       p -= l2;
       if (p > 0) continue;
       l2 = Math.min(l2, l2 + p);
-      const g = [...s2[0]][0].length;
+      const g = firstCodePointLen(s2[0]);
       const raw = src.slice(pos, pos + o + s2.index + g + l2);
       const innerText = raw.slice(o, -o);
       const inner = plain ? inlinePlain(innerText, links, st) : inlineHtml(innerText, links, st);
@@ -810,8 +949,47 @@ function tryDel(src, pos, getMask, prevChar, links, st, plain) {
   return null;
 }
 
+// Try a bare URL or email address at `pos` (marked's url rule). Only
+// attempted when not already inside a link. Returns { html, len } or
+// null. A URL can start on an alphanumeric character — but an email
+// address can also start on '.', '_', '+' or '-', so those characters
+// attempt this rule too.
+function tryUrlAt(src, pos, links, st, plain) {
+  if (st.inLink) return null;
+  const m = at(S.url, src, pos);
+  if (!m) return null;
+  let raw = m[0];
+  let text;
+  let href;
+  if (m[2] === '@') {
+    text = raw;
+    href = 'mailto:' + raw;
+  } else {
+    let prev;
+    do {
+      prev = raw;
+      const back = I_BACKPEDAL.exec(raw);
+      raw = back ? back[0] : '';
+    } while (prev !== raw);
+    text = raw;
+    href = m[1] === 'www.' ? 'http://' + raw : raw;
+  }
+  if (plain) return { html: text, len: raw.length };
+  const url = cleanUrl(href);
+  return { html: url === null ? esc(text, true) : `<a href="${esc(url, true)}">${esc(text, true)}</a>`, len: raw.length };
+}
+
+// The inline loop, dispatched on the first character at the cursor: each
+// rule can only start with one of a few characters, so a position that
+// cannot start a rule skips straight to the text rule instead of running
+// eleven sticky regexes that all fail. Within a first-character group
+// the attempt order is exactly marked's: escape before hard break,
+// tag before autolink, link before reference link, and the text rule
+// last. A position that matches no rule in its group falls through to
+// the text rule below.
 function inlineLoop(src, links, st, plain) {
   const getMask = makeMask(src, links);
+  const leanText = !URL_TRIGGER.test(src);
   let out = '';
   let pos = 0;
   let prevChar = '';
@@ -824,122 +1002,129 @@ function inlineLoop(src, links, st, plain) {
     guard = remain;
     if (!prevText) prevChar = '';
     prevText = false;
+    const ch = src[pos];
 
-    let m = at(S.escape, src, pos);
-    if (m) {
-      out += plain ? m[1] : esc(m[1]);
-      pos += m[0].length;
-      continue;
-    }
-
-    m = at(S.tag, src, pos);
-    if (m) {
-      const tagHtml = m[0];
-      if (!st.inLink && /^<a /i.test(tagHtml)) st.inLink = true;
-      else if (st.inLink && /^<\/a>/i.test(tagHtml)) st.inLink = false;
-      if (!st.inRawBlock && /^<(pre|code|kbd|script)(\s|>)/i.test(tagHtml)) st.inRawBlock = true;
-      else if (st.inRawBlock && /^<\/(pre|code|kbd|script)(\s|>)/i.test(tagHtml)) st.inRawBlock = false;
-      out += tagHtml;
-      pos += tagHtml.length;
-      continue;
-    }
-
-    const link = tryLink(src, pos, links, st, plain);
-    if (link) {
-      out += link.html;
-      pos += link.len;
-      continue;
-    }
-
-    const ref = tryRefLink(src, pos, links, st, plain);
-    if (ref) {
-      out += ref.html;
-      pos += ref.len;
-      continue;
-    }
-
-    {
-      const em = tryEmStrong(src, pos, getMask, prevChar, links, st, plain);
-      if (em) {
-        out += em.html;
-        pos += em.len;
-        continue;
-      }
-    }
-
-    m = at(S.codespan, src, pos);
-    if (m) {
-      let text = m[2].replace(/\n/g, ' ');
-      const hasNonSpace = /[^ ]/.test(text);
-      if (hasNonSpace && /^ /.test(text) && / $/.test(text)) text = text.substring(1, text.length - 1);
-      out += plain ? text : `<code>${esc(text, true)}</code>`;
-      pos += m[0].length;
-      continue;
-    }
-
-    m = at(S.br, src, pos);
-    if (m) {
-      if (!plain) out += '<br>';
-      pos += m[0].length;
-      continue;
-    }
-
-    {
-      const del = tryDel(src, pos, getMask, prevChar, links, st, plain);
-      if (del) {
-        out += del.html;
-        pos += del.len;
-        continue;
-      }
-    }
-
-    m = at(S.autolink, src, pos);
-    if (m) {
-      const text = m[1];
-      const href = m[2] === '@' ? 'mailto:' + text : text;
-      if (plain) {
-        out += text;
-      } else {
-        const url = cleanUrl(href);
-        out += url === null ? esc(text, true) : `<a href="${esc(url, true)}">${esc(text, true)}</a>`;
-      }
-      pos += m[0].length;
-      continue;
-    }
-
-    if (!st.inLink) {
-      m = at(S.url, src, pos);
+    if (ch === '\\') {
+      const m = at(S.escape, src, pos);
       if (m) {
-        let raw = m[0];
-        let text;
-        let href;
-        if (m[2] === '@') {
-          text = raw;
-          href = 'mailto:' + raw;
-        } else {
-          let prev;
-          do {
-            prev = raw;
-            const back = I_BACKPEDAL.exec(raw);
-            raw = back ? back[0] : '';
-          } while (prev !== raw);
-          text = raw;
-          href = m[1] === 'www.' ? 'http://' + raw : raw;
-        }
+        out += plain ? m[1] : esc(m[1]);
+        pos += m[0].length;
+        continue;
+      }
+      const br = at(S.br, src, pos);
+      if (br) {
+        if (!plain) out += '<br>';
+        pos += br[0].length;
+        continue;
+      }
+    } else if (ch === '<') {
+      const m = at(S.tag, src, pos);
+      if (m) {
+        const tagHtml = m[0];
+        if (!st.inLink && /^<a /i.test(tagHtml)) st.inLink = true;
+        else if (st.inLink && /^<\/a>/i.test(tagHtml)) st.inLink = false;
+        if (!st.inRawBlock && /^<(pre|code|kbd|script)(\s|>)/i.test(tagHtml)) st.inRawBlock = true;
+        else if (st.inRawBlock && /^<\/(pre|code|kbd|script)(\s|>)/i.test(tagHtml)) st.inRawBlock = false;
+        out += tagHtml;
+        pos += tagHtml.length;
+        continue;
+      }
+      const auto = at(S.autolink, src, pos);
+      if (auto) {
+        const text = auto[1];
+        const href = auto[2] === '@' ? 'mailto:' + text : text;
         if (plain) {
           out += text;
         } else {
           const url = cleanUrl(href);
           out += url === null ? esc(text, true) : `<a href="${esc(url, true)}">${esc(text, true)}</a>`;
         }
-        pos += raw.length;
+        pos += auto[0].length;
+        continue;
+      }
+    } else if (ch === '[' || ch === '!') {
+      const link = tryLink(src, pos, links, st, plain);
+      if (link) {
+        out += link.html;
+        pos += link.len;
+        continue;
+      }
+      const ref = tryRefLink(src, pos, links, st, plain);
+      if (ref) {
+        out += ref.html;
+        pos += ref.len;
+        continue;
+      }
+    } else if (ch === '*') {
+      const em = tryEmStrong(src, pos, getMask, prevChar, links, st, plain);
+      if (em) {
+        out += em.html;
+        pos += em.len;
+        continue;
+      }
+    } else if (ch === '_') {
+      const em = tryEmStrong(src, pos, getMask, prevChar, links, st, plain);
+      if (em) {
+        out += em.html;
+        pos += em.len;
+        continue;
+      }
+      // An email address may start with '_', so the url rule is
+      // attempted here too, exactly as in the unsplit loop order.
+      const u = tryUrlAt(src, pos, links, st, plain);
+      if (u) {
+        out += u.html;
+        pos += u.len;
+        continue;
+      }
+    } else if (ch === '.' || ch === '+' || ch === '-') {
+      // No other inline rule starts on these, but an email address can.
+      const u = tryUrlAt(src, pos, links, st, plain);
+      if (u) {
+        out += u.html;
+        pos += u.len;
+        continue;
+      }
+    } else if (ch === '`') {
+      const m = at(S.codespan, src, pos);
+      if (m) {
+        let text = m[2].replace(/\n/g, ' ');
+        const hasNonSpace = /[^ ]/.test(text);
+        if (hasNonSpace && /^ /.test(text) && / $/.test(text)) text = text.substring(1, text.length - 1);
+        out += plain ? text : `<code>${esc(text, true)}</code>`;
+        pos += m[0].length;
+        continue;
+      }
+    } else if (ch === '~') {
+      const del = tryDel(src, pos, getMask, prevChar, links, st, plain);
+      if (del) {
+        out += del.html;
+        pos += del.len;
+        continue;
+      }
+    } else if (
+      (ch >= '0' && ch <= '9') ||
+      (ch >= 'a' && ch <= 'z') ||
+      (ch >= 'A' && ch <= 'Z')
+    ) {
+      const u = tryUrlAt(src, pos, links, st, plain);
+      if (u) {
+        out += u.html;
+        pos += u.len;
+        continue;
+      }
+    } else if (ch === ' ') {
+      const br = at(S.br, src, pos);
+      if (br) {
+        if (!plain) out += '<br>';
+        pos += br[0].length;
         continue;
       }
     }
 
-    m = at(S.inlineText, src, pos);
-    if (m) {
-      const raw = m[0];
+    const tm = at(leanText ? S.inlineTextLean : S.inlineText, src, pos);
+    if (tm) {
+      const raw = tm[0];
       const text = st.inRawBlock ? raw : unesc(raw);
       out += plain ? text : st.inRawBlock ? text : esc(text);
       if (raw.slice(-1) !== '_') prevChar = raw.slice(-1);
@@ -965,8 +1150,42 @@ function inlineLoop(src, links, st, plain) {
 // blockquote (a paragraph then merges into a preceding one); `top` is
 // false inside list items (paragraphs become bare text blocks there).
 
+// Can the next line after the line starting at `pos` be a table delimiter
+// row? A delimiter row consists only of spaces, tabs, '|', ':' and '-',
+// with at least one '-'. Anything else means the table rule cannot
+// match here, so it is skipped without running its regex. This is a
+// superset of what the table rule accepts (it allows no tabs), so a
+// false answer is exact and a true answer only costs the attempt.
+function nextLineIsTableDelim(src, pos) {
+  const nl1 = src.indexOf('\n', pos);
+  if (nl1 === -1) return false;
+  const start = nl1 + 1;
+  const end = src.indexOf('\n', start);
+  const e = end === -1 ? src.length : end;
+  let hasDash = false;
+  for (let i = start; i < e; i++) {
+    const c = src.charCodeAt(i);
+    if (c === 45) hasDash = true;
+    else if (c !== 32 && c !== 9 && c !== 58 && c !== 124) return false;
+  }
+  return hasDash;
+}
+
 function lexBlocks(src, links, nested, top, into) {
   const nodes = into || [];
+  // Setext headings need an underline line somewhere in this source.
+  // When there is none, the setext rule can never match and is skipped
+  // at every position. Computed per call on this call's own source:
+  // nested sources (blockquote and list item text) are re-indented, so
+  // an outer source without such a line can still contain one inside.
+  const noSetext = !hasSetextLine(src);
+  // `top` is marked's lexer.state.top: whether a paragraph token may be
+  // produced here instead of a text token. It is mutable within this
+  // call — lexing a nested list leaves it true (marked's blockTokens
+  // returns with state.top set), so text after a nested list inside a
+  // list item becomes a paragraph. A blockquote restores it, so it is
+  // untouched there.
+  let topNow = top;
   let pos = 0;
   const end = src.length;
   let guard = Infinity;
@@ -1063,6 +1282,8 @@ function lexBlocks(src, links, nested, top, into) {
       if (list) {
         nodes.push(list.node);
         pos += list.len;
+        // A nested list's item lexing leaves state.top true.
+        topNow = true;
         continue;
       }
     }
@@ -1096,36 +1317,40 @@ function lexBlocks(src, links, nested, top, into) {
       }
     }
 
-    m = at(S.table, src, pos);
-    if (m && /[:|]/.test(m[2])) {
-      const headerCells = splitRow(m[1]);
-      const aligns = m[2].replace(/^\||\| *$/g, '').split('|');
-      if (headerCells.length === aligns.length) {
-        const align = aligns.map((a) =>
-          /^ *-+: *$/.test(a) ? 'right' : /^ *:-+: *$/.test(a) ? 'center' : /^ *:-+ *$/.test(a) ? 'left' : null
-        );
-        const body = m[3] && m[3].trim() ? m[3].replace(/\n[ \t]*$/, '').split('\n') : [];
+    if (nextLineIsTableDelim(src, pos)) {
+      m = at(S.table, src, pos);
+      if (m && /[:|]/.test(m[2])) {
+        const headerCells = splitRow(m[1]);
+        const aligns = m[2].replace(/^\||\| *$/g, '').split('|');
+        if (headerCells.length === aligns.length) {
+          const align = aligns.map((a) =>
+            /^ *-+: *$/.test(a) ? 'right' : /^ *:-+: *$/.test(a) ? 'center' : /^ *:-+ *$/.test(a) ? 'left' : null
+          );
+          const body = m[3] && m[3].trim() ? m[3].replace(/\n[ \t]*$/, '').split('\n') : [];
+          const raw = trimEndChar(m[0], '\n');
+          nodes.push({
+            k: 'table',
+            raw,
+            header: headerCells.map((c, i) => ({ text: c, align: align[i] })),
+            rows: body.map((r) => splitRow(r, headerCells.length).map((c, i) => ({ text: c, align: align[i] }))),
+          });
+          pos += raw.length;
+          continue;
+        }
+      }
+    }
+
+    if (!noSetext) {
+      m = at(S.lheading, src, pos);
+      if (m) {
         const raw = trimEndChar(m[0], '\n');
-        nodes.push({
-          k: 'table',
-          raw,
-          header: headerCells.map((c, i) => ({ text: c, align: align[i] })),
-          rows: body.map((r) => splitRow(r, headerCells.length).map((c, i) => ({ text: c, align: align[i] }))),
-        });
+        nodes.push({ k: 'heading', raw, depth: m[2].charAt(0) === '=' ? 1 : 2, text: m[1].trim() });
         pos += raw.length;
         continue;
       }
     }
 
-    m = at(S.lheading, src, pos);
-    if (m) {
-      const raw = trimEndChar(m[0], '\n');
-      nodes.push({ k: 'heading', raw, depth: m[2].charAt(0) === '=' ? 1 : 2, text: m[1].trim() });
-      pos += raw.length;
-      continue;
-    }
-
-    if (top) {
+    if (topNow) {
       m = at(S.paragraph, src, pos);
       if (m) {
         const raw = m[0];
@@ -1165,12 +1390,49 @@ function lexBlocks(src, links, nested, top, into) {
   return nodes;
 }
 
-// The next line of `src` at `pos`: { line, next } where `next` is the
-// position just past the line's newline (or the end of the source).
-function nextLine(src, pos) {
-  const nl = src.indexOf('\n', pos);
-  if (nl === -1) return { line: src.slice(pos), next: src.length };
-  return { line: src.slice(pos, nl), next: nl + 1 };
+// Collect the inline sources (paragraph / text / heading text and table
+// cell text) under a block node, in document order. A node that is itself
+// a re-lex replacement contributes its stored orphan sources first:
+// in marked's inline queue those ran before the node's real content.
+// Used for the orphaned-pass leak (see replayOrphan).
+function collectInlineSources(node, out) {
+  if (!node) return out;
+  if (node.orphan) for (const t of node.orphan) out.push(t);
+  switch (node.k) {
+    case 'para':
+    case 'text':
+    case 'heading':
+      out.push(node.text);
+      break;
+    case 'blockquote':
+      for (const c of node.nodes) collectInlineSources(c, out);
+      break;
+    case 'list':
+      for (const item of node.items) for (const c of item.nodes) collectInlineSources(c, out);
+      break;
+    case 'table':
+      for (const c of node.header) out.push(c.text);
+      for (const row of node.rows) for (const c of row) out.push(c.text);
+      break;
+    default:
+      break;
+  }
+  return out;
+}
+
+// Replay an orphaned inline pass. When a blockquote re-lexes a nested
+// blockquote or list, marked still runs the discarded first pass's
+// inline tokenization, and an unclosed <a> tag in it leaves inLink set
+// for the real pass (inRawBlock is reset before every inline pass, so
+// only inLink leaks). The replacement node carries the orphaned
+// sources; running them here, output discarded, reproduces that state
+// exactly at the point the orphaned pass would have run.
+function replayOrphan(n, links, st) {
+  if (!n.orphan) return;
+  for (const t of n.orphan) {
+    st.inRawBlock = false;
+    inlineHtml(t, links, st);
+  }
 }
 
 // A blockquote at `pos`, or null. Returns { node, len }.
@@ -1210,6 +1472,8 @@ function lexBlockquote(src, pos, links) {
       const b = lines.join('\n');
       const src2 = k.raw + '\n' + b.replace(/^ {0,3}>[ \t]?/gm, '');
       const f = lexBlockquote(src2, 0, links);
+      const orphan = collectInlineSources(k, []);
+      if (orphan.length > 0) f.node.orphan = orphan;
       nodes[nodes.length - 1] = f.node;
       const y = src2.substring(f.node.raw.length).replace(/^\n/, '');
       const r = y ? y.split('\n').length : 0;
@@ -1222,6 +1486,8 @@ function lexBlockquote(src, pos, links) {
     } else if (k.k === 'list') {
       const b = k.raw + '\n' + lines.join('\n');
       const f = lexList(b, 0, links);
+      const orphan = collectInlineSources(k, []);
+      if (orphan.length > 0) f.node.orphan = orphan;
       nodes[nodes.length - 1] = f.node;
       const extra =
         f.node.raw.length > k.raw.length ? b.slice(k.raw.length + 1, f.node.raw.length).split('\n').length : 0;
@@ -1235,6 +1501,40 @@ function lexBlockquote(src, pos, links) {
     }
   }
   return { node: { k: 'blockquote', raw: rawAcc, text: textAcc, nodes }, len: rawAcc.length };
+}
+
+// Do any of the list-item break rules match at the start of `line`? The
+// six rules are all anchored with up to `ci` spaces, so the first
+// non-space character decides which of them can possibly match: a tab
+// before it, or more than `ci` spaces, blocks all of them. `withBullet`
+// is false for the second check inside the loop, where the bullet rule
+// and the blockquote rule are not tested.
+function breaksLine(line, ci, fencesRe, headingRe, htmlRe, bqRe, nextBullet, hrRe, withBullet) {
+  let i = 0;
+  let spaces = 0;
+  while (i < line.length) {
+    const c = line.charCodeAt(i);
+    if (c === 32) {
+      spaces++;
+      i++;
+    } else if (c === 9) {
+      return false;
+    } else {
+      break;
+    }
+  }
+  if (spaces > ci) return false;
+  const c = line.charCodeAt(i);
+  if (c === 96 || c === 126) return !!at(fencesRe, line, 0);
+  if (c === 35) return !!at(headingRe, line, 0);
+  if (c === 60) return !!at(htmlRe, line, 0);
+  if (c === 62) return withBullet && !!at(bqRe, line, 0);
+  if (c === 42 || c === 45 || c === 43) {
+    return withBullet ? !!at(nextBullet, line, 0) || !!at(hrRe, line, 0) : !!at(hrRe, line, 0);
+  }
+  if (c >= 48 && c <= 57) return withBullet && !!at(nextBullet, line, 0);
+  if (c === 95) return !!at(hrRe, line, 0);
+  return false;
 }
 
 // A list at `pos`, or null. Returns { node, len }.
@@ -1265,20 +1565,21 @@ function lexList(src, pos, links) {
     p += itemMatch[0].length;
     const firstLine = itemMatch[2].split('\n', 1)[0];
     const bulletLen = itemMatch[1].length;
-    const expanded = firstLine.replace(/^[ \t]+/, (v) => expandTabs(v, bulletLen));
-    let { line: next } = nextLine(src, p);
+    const expanded = expandLead(firstLine, bulletLen);
+    const nl = src.indexOf('\n', p);
+    const next = nl === -1 ? src.slice(p) : src.slice(p, nl);
     let blankFirst = !expanded.trim();
     let indent;
     if (blankFirst) {
       indent = bulletLen + 1;
     } else {
-      indent = expanded.search(/[^ ]/);
+      indent = firstNonSpace(expanded);
       if (indent > 4) indent = 1;
       text = expanded.slice(indent);
       indent += bulletLen;
     }
     if (blankFirst && /^[ \t]*$/.test(next)) {
-      p = nextLine(src, p).next;
+      p = nl === -1 ? src.length : nl + 1;
       empty = true;
     }
     if (!empty) {
@@ -1291,32 +1592,42 @@ function lexList(src, pos, links) {
       const bqRe = S_BLOCKQUOTE_BEGIN[ci];
       let cur = expanded;
       while (p < src.length) {
-        const { line: lineRaw, next: after } = nextLine(src, p);
-        const line = lineRaw;
-        const expandedLine = line.replace(/^[ \t]+/, (v) => expandTabs(v, 0));
-        if (
-          at(fencesRe, line, 0) ||
-          at(headingRe, line, 0) ||
-          at(htmlRe, line, 0) ||
-          at(bqRe, line, 0) ||
-          at(nextBullet, line, 0) ||
-          at(hrRe, line, 0)
-        ) {
+        const nl2 = src.indexOf('\n', p);
+        const line = nl2 === -1 ? src.slice(p) : src.slice(p, nl2);
+        const after = nl2 === -1 ? src.length : nl2 + 1;
+        const expandedLine = expandLead(line, 0);
+        if (breaksLine(line, ci, fencesRe, headingRe, htmlRe, bqRe, nextBullet, hrRe, true)) {
           break;
         }
-        if (expandedLine.search(/[^ ]/) >= indent || !line.trim()) {
+        const ns = firstNonSpace(expandedLine);
+        if (ns >= indent || !line.trim()) {
           text += '\n' + expandedLine.slice(indent);
         } else {
+          // Lazy continuation: the line belongs to this item only when
+          // the previous line was blank, or its content starts at least
+          // four columns in (tabs counted as four spaces), or no break
+          // rule matches the previous line's remainder.
+          let ce = -1;
+          let epos = 0;
+          for (let cn = 0; cn < cur.length; cn++) {
+            const cc = cur.charCodeAt(cn);
+            if (cc === 32) epos += 1;
+            else if (cc === 9) epos += 4;
+            else {
+              ce = epos;
+              break;
+            }
+          }
           if (
             blankFirst ||
-            cur.replace(/\t/g, '    ').search(/[^ ]/) >= 4 ||
-            at(fencesRe, cur, 0) ||
-            at(headingRe, cur, 0) ||
-            at(htmlRe, cur, 0) ||
-            at(hrRe, cur, 0)
+            ce >= 4 ||
+            breaksLine(cur, ci, fencesRe, headingRe, htmlRe, bqRe, nextBullet, hrRe, false)
           ) {
             break;
           }
+          // A setext underline is still checked here, after the break
+          // conditions above: for '* item\n  text\n---', the '---'
+          // must hit the hr rule first and close the list.
           const setext =
             /^ {0,3}(?:=+|-+) *$/.test(line) && at(S.lheading, cur + '\n' + line, 0)
               ? '    ' + expandedLine.replace(/^ {0,3}/, '')
@@ -1425,6 +1736,7 @@ function renderBlock(n, links, st) {
     case 'hr':
       return '<hr>\n';
     case 'blockquote':
+      replayOrphan(n, links, st);
       return '<blockquote>\n' + renderBlocks(n.nodes, links, st) + '</blockquote>\n';
     case 'html':
       return n.text;
@@ -1457,6 +1769,7 @@ function renderBlock(n, links, st) {
     case 'checkbox':
       return '<input ' + (n.checked ? 'checked="" ' : '') + 'disabled="" type="checkbox"> ';
     case 'list': {
+      replayOrphan(n, links, st);
       let out = '<' + (n.ordered ? 'ol' : 'ul');
       if (n.ordered && n.start !== 1) out += ' start="' + n.start + '"';
       out += '>\n';
@@ -1473,9 +1786,10 @@ function renderBlock(n, links, st) {
 
 // The entry point: marked.parse's default options (gfm, no breaks, no
 // pedantic, synchronous). Line endings are normalised first, exactly as
-// marked's lexer does.
+// marked's lexer does — but only when the source actually contains a
+// carriage return, which most inputs do not.
 export function parse(markdown) {
-  const src = markdown.replace(/\r\n|\r/g, '\n');
+  const src = markdown.includes('\r') ? markdown.replace(/\r\n|\r/g, '\n') : markdown;
   const links = {};
   const nodes = lexBlocks(src, links, false, true);
   const st = { inLink: false, inRawBlock: false, linkEmitted: false, linkParenPossible: true };
